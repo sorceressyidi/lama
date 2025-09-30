@@ -27,26 +27,36 @@ import tqdm
 import yaml
 from omegaconf import OmegaConf
 from torch.utils.data._utils.collate import default_collate
-
+import PIL.Image as Image
 from saicinpainting.training.data.datasets import make_default_val_dataset
 from saicinpainting.training.trainers import load_checkpoint
 from saicinpainting.utils import register_debug_signal_handlers
 
 LOGGER = logging.getLogger(__name__)
 
-
+def load_image(fname, mode='RGB', return_orig=False):
+    img = np.array(Image.open(fname).convert(mode))
+    if img.ndim == 3:
+        img = np.transpose(img, (2, 0, 1))
+    out_img = img.astype('float32') / 255
+    if return_orig:
+        return out_img, img
+    else:
+        return out_img
+    
 @hydra.main(config_path='../configs/prediction', config_name='default.yaml')
 def main(predict_config: OmegaConf):
+    # global background_path
     try:
         if sys.platform != 'win32':
             register_debug_signal_handlers()  # kill -10 <pid> will result in traceback dumped into log
 
         device = torch.device("cpu")
-
         train_config_path = os.path.join(predict_config.model.path, 'config.yaml')
         with open(train_config_path, 'r') as f:
             train_config = OmegaConf.create(yaml.safe_load(f))
-        
+        scene_name = predict_config.scene_name  
+        background_path = f'../../../../data/scene_background/{scene_name}/background.png'
         train_config.training_model.predict_only = True
         train_config.visualizer.kind = 'noop'
 
@@ -56,14 +66,16 @@ def main(predict_config: OmegaConf):
                                        'models', 
                                        predict_config.model.checkpoint)
         model = load_checkpoint(train_config, checkpoint_path, strict=False, map_location='cpu')
+        train_config_path = os.path.join(predict_config.model.path, 'config.yaml')
         model.freeze()
         if not predict_config.get('refine', False):
             model.to(device)
 
         if not predict_config.indir.endswith('/'):
             predict_config.indir += '/'
-
+            
         dataset = make_default_val_dataset(predict_config.indir, **predict_config.dataset)
+        img = dataset[0]["image"].copy()
         for img_i in tqdm.trange(len(dataset)):
             mask_fname = dataset.mask_filenames[img_i]
             cur_out_fname = os.path.join(
@@ -91,7 +103,18 @@ def main(predict_config: OmegaConf):
 
             cur_res = np.clip(cur_res * 255, 0, 255).astype('uint8')
             cur_res = cv2.cvtColor(cur_res, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(cur_out_fname, cur_res)
+            
+            cv2.imwrite(os.path.join(predict_config.indir, f"image_{(img_i+1):04d}.png"), cur_res)
+            print(f"background_path: {background_path}")
+            background_path = os.path.abspath(background_path)
+            os.makedirs(os.path.dirname(background_path), exist_ok=True)
+            cv2.imwrite(background_path, cur_res)
+            dataset = make_default_val_dataset(predict_config.indir, **predict_config.dataset)
+            saved = np.clip(img * 255, 0, 255).astype('uint8')
+            saved = cv2.cvtColor(cur_res, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(f"./out_mask/original{img_i}.png", saved)  
+        
+        return cur_res
 
     except KeyboardInterrupt:
         LOGGER.warning('Interrupted by user')
